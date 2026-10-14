@@ -1,0 +1,599 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# tui-acl v2.2 - Samba AD / Linux POSIX ACL 互動式全螢幕管理面板
+# 升級內容: 新增「將目前資料夾權限強制套用至下層」功能 (含雙重安全確認與自動備份)
+# 執行方式: 本工具需以 root 身份直接執行 (不再於內部呼叫 sudo)
+# ==============================================================================
+
+set -o pipefail
+
+# 本腳本的絕對路徑 (fzf 的 reload / execute 會以子程序重新呼叫自己)
+SELF=$(readlink -f "$0")
+
+# 快取與備份一律放在僅 root 可寫的目錄，避免 /tmp 下可被其他本機使用者預先佔用的路徑
+CACHE_DIR="/var/cache/tui-acl"
+BACKUP_DIR="/var/backups/tui-acl"
+
+# 建立僅 root 可用的目錄；若已存在但不是 root 擁有的真實目錄 (例如被人以 symlink 佔用) 則拒絕執行
+setup_private_dir() {
+    local dir="$1"
+    mkdir -m 700 -p "$dir" 2>/dev/null
+    if [[ -L "$dir" || ! -d "$dir" || ! -O "$dir" ]]; then
+        echo "❌ 錯誤：目錄 $dir 不存在、是 symlink、或擁有者不是 root，拒絕使用。" >&2
+        exit 1
+    fi
+    chmod 700 "$dir"
+}
+
+# --- 產生右側彩色預覽面板的輔助腳本 ---
+write_preview_helper() {
+cat << 'PREVIEW_EOF' > "$PREVIEW_HELPER"
+#!/usr/bin/env bash
+# 參數優先；沒有參數時改用主程式匯出的 TUI_ACL_TARGET (避免路徑含引號時破壞 fzf 指令字串)
+RAW_INPUT="${1:-$TUI_ACL_TARGET}"
+BASE_DIR="$2"
+
+if [[ "$RAW_INPUT" == ".."* && -n "$BASE_DIR" ]]; then
+    T=$(realpath "$BASE_DIR/.." 2>/dev/null)
+elif [[ -n "$BASE_DIR" && ! -e "$RAW_INPUT" ]]; then
+    T=$(realpath "$BASE_DIR/$RAW_INPUT" 2>/dev/null)
+else
+    T=$(realpath "$RAW_INPUT" 2>/dev/null)
+fi
+
+if [[ -z "$T" || ! -e "$T" ]]; then
+    echo "無法讀取路徑資訊: $RAW_INPUT"
+    exit 0
+fi
+
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_CYAN="\033[1;36m"
+C_GREEN="\033[1;32m"
+C_YELLOW="\033[1;33m"
+C_RED="\033[1;31m"
+C_BLUE="\033[1;34m"
+C_GRAY="\033[0;90m"
+
+echo -e "${C_CYAN}━━━ 📂 目標基本權限 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+if [[ -d "$T" ]]; then
+    echo -e " ${C_BOLD}路徑:${C_RESET} ${C_BLUE}$T/${C_RESET} (目錄)"
+else
+    echo -e " ${C_BOLD}路徑:${C_RESET} $T (檔案)"
+fi
+STAT_INFO=$(stat -c " ${C_BOLD}擁有者:${C_RESET} %U (UID:%u)  |  ${C_BOLD}群組:${C_RESET} %G (GID:%g)\n ${C_BOLD}傳統權限:${C_RESET} %A (%a)" "$T" 2>/dev/null)
+echo -e "$STAT_INFO"
+
+echo -e "\n${C_CYAN}━━━ 🛡️  現行存取控制 (Access ACL) ━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+getfacl -p "$T" 2>/dev/null | grep -vE '^#|^$' | grep -v '^default:' | sed 's/\\040/ /g' | while IFS= read -r line; do
+    if [[ "$line" == *"effective:"* ]]; then
+        echo -e "  ${C_RED}⚠️  $line (受 mask 限制！)${C_RESET}"
+    elif [[ "$line" =~ ^(user|group):[^:]+: ]]; then
+        echo -e "  ${C_GREEN}●  $line${C_RESET}"
+    elif [[ "$line" == mask:* ]]; then
+        echo -e "  ${C_YELLOW}◈  $line${C_RESET}"
+    else
+        echo -e "  ${C_GRAY}○  $line${C_RESET}"
+    fi
+done
+
+if [[ -d "$T" ]]; then
+    echo -e "\n${C_CYAN}━━━ 🧬 預設繼承規則 (Default ACL - 新建項目自動套用) ━━━${C_RESET}"
+    DEF_LINES=$(getfacl -p "$T" 2>/dev/null | grep '^default:' | sed 's/\\040/ /g')
+    if [[ -z "$DEF_LINES" ]]; then
+        echo -e "  ${C_GRAY}(尚未設定 Default 繼承規則)${C_RESET}"
+    else
+        echo "$DEF_LINES" | while IFS= read -r line; do
+            if [[ "$line" =~ ^default:(user|group):[^:]+: ]]; then
+                echo -e "  ${C_YELLOW}◆  ${line#default:}${C_RESET}"
+            else
+                echo -e "  ${C_GRAY}◇  ${line#default:}${C_RESET}"
+            fi
+        done
+    fi
+
+    echo -e "\n${C_CYAN}━━━ 📁 目錄內容與權限預覽 (前 15 項) ━━━━━━━━━━━━━━━━━━━━${C_RESET}"
+    ls -lA --color=always "$T" 2>/dev/null | tail -n +2 | head -n 15 | sed 's/^/  /'
+fi
+PREVIEW_EOF
+chmod +x "$PREVIEW_HELPER"
+}
+
+# --- 產生主畫面左側選單函式 ---
+build_main_menu() {
+    local tgt="$1"
+    echo -e "ACT:CHDIR\t📂 🧭 瀏覽 / 切換目標路徑 (即時巡檢各目錄 ACL)"
+    echo -e "ACT:ADD_USER\t➕ 👤 新增 / 修改 使用者 (User ACL)"
+    echo -e "ACT:ADD_GROUP\t➕ 👥 新增 / 修改 群組 (Group ACL)"
+    if [[ -d "$tgt" ]]; then
+        echo -e "ACT:PROPAGATE\t🌳 ⚠️  將目前資料夾權限套用至下層所有目錄 (危險操作)"
+    fi
+    echo -e "ACT:EDIT_RAW\t📝 🛠️  使用文字編輯器批次編輯 (Vim/Nano 模式)"
+    echo -e "ACT:RECALC_MASK\t⚖️  🔧 重新計算有效遮罩 (以各條目聯集重算 mask，修復 #effective 降權)"
+    echo -e "ACT:CLEAR_ALL\t🧹 ⚠️  清除所有擴充 ACL (-b 還原傳統權限)"
+    echo -e "ACT:EXIT\t🚪 ❌ 離開 (Exit)"
+    echo -e "SEP\t━━━━━━━━━━━━━━━━━━ 點選下方現有條目：Enter 修改 / Ctrl-D 刪除 ━━━━━━━━━━━━━━━━━━"
+
+    getfacl -cp "$tgt" 2>/dev/null | sed 's/\\040/ /g' | grep -E '^(default:)?(user|group):[^:]+:' | while IFS= read -r line; do
+        # 受 mask 限制的條目會帶有 "<TAB>#effective:r-x" 尾註，須先剝除，否則 TAB 會破壞 fzf 欄位分隔
+        eff_note=""
+        if [[ "$line" == *"#effective:"* ]]; then
+            eff_note=" \033[1;31m⚠️ 有效:${line##*#effective:}\033[0m"
+            line="${line%%[[:space:]]#*}"
+        fi
+        if [[ "$line" == default:* ]]; then
+            clean="${line#default:}"
+            type_col="${clean%%:*}"
+            rest="${clean#*:}"
+            name_col="${rest%:*}"
+            perm_col="${rest##*:}"
+            printf "ITEM:d:%s:%s\t\033[1;33m[預設繼承] %-6s\033[0m │ %-28s │ 權限: \033[1;36m%s\033[0m%b\n" "$type_col" "$name_col" "$type_col" "$name_col" "$perm_col" "$eff_note"
+        else
+            type_col="${line%%:*}"
+            rest="${line#*:}"
+            name_col="${rest%:*}"
+            perm_col="${rest##*:}"
+            printf "ITEM:a:%s:%s\t\033[1;32m[現行存取] %-6s\033[0m │ %-28s │ 權限: \033[1;36m%s\033[0m%b\n" "$type_col" "$name_col" "$type_col" "$name_col" "$perm_col" "$eff_note"
+        fi
+    done
+}
+
+# --- 供 fzf 子程序呼叫的內部子指令 (目標路徑由環境變數 TUI_ACL_TARGET 傳遞) ---
+if [[ "$1" == "--dump-menu" ]]; then
+    build_main_menu "${2:-$TUI_ACL_TARGET}"
+    exit 0
+fi
+if [[ "$1" == "--delete-entry" ]]; then
+    # 由 fzf 的 execute 呼叫 (有 TTY)：成功時安靜返回，失敗時顯示錯誤並等待 Enter
+    tag="$2"
+    case "$tag" in
+        ITEM:a:*) spec="${tag#ITEM:a:}" ;;
+        ITEM:d:*) spec="d:${tag#ITEM:d:}" ;;
+        *) exit 0 ;;
+    esac
+    if ! err=$(setfacl -x "$spec" "$TUI_ACL_TARGET" 2>&1); then
+        echo -e "\n❌ \033[1;31m刪除條目 [$spec] 失敗，權限未變更：\033[0m"
+        echo "$err" | sed 's/^/   /'
+        read -r -p "請按 [Enter] 鍵返回 ACL 控制台..." _
+        exit 1
+    fi
+    exit 0
+fi
+
+TARGET=$(realpath "${1:-.}" 2>/dev/null)
+if [[ -z "$TARGET" || ! -e "$TARGET" ]]; then
+    echo "❌ 錯誤：找不到目標路徑 '${1:-.}'"
+    exit 1
+fi
+
+if [[ $EUID -ne 0 ]]; then
+    echo "❌ 錯誤：本工具需以 root 身份執行 (請改用 sudo $0 ${1:-.})"
+    exit 1
+fi
+
+setup_private_dir "$CACHE_DIR"
+setup_private_dir "$BACKUP_DIR"
+PREVIEW_HELPER="$CACHE_DIR/preview.sh"
+write_preview_helper
+
+# --- AD 與本機帳號快取讀取函式 ---
+get_entities() {
+    local mode="$1"
+    local force="$2"
+    local cache_file="$CACHE_DIR/${mode}.list"
+
+    if [[ "$force" == "force" || ! -f "$cache_file" || $(find "$cache_file" -mmin +10 2>/dev/null) ]]; then
+        if [[ "$mode" == "users" ]]; then
+            {
+                if command -v wbinfo >/dev/null 2>&1 && wbinfo -p >/dev/null 2>&1; then
+                    wbinfo -u 2>/dev/null
+                fi
+                getent passwd | awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}'
+                getent passwd www-data samba 2>/dev/null | cut -d: -f1
+            } | sort -u > "$cache_file"
+        else
+            {
+                if command -v wbinfo >/dev/null 2>&1 && wbinfo -p >/dev/null 2>&1; then
+                    wbinfo -g 2>/dev/null
+                fi
+                getent group | awk -F: '$3 >= 1000 && $1 != "nogroup" {print $1}'
+            } | sort -u > "$cache_file"
+        fi
+    fi
+
+    local current_acl
+    current_acl=$(getfacl -cp "$TARGET" 2>/dev/null | sed -E 's/\\040/ /g; s/[[:space:]]+#.*$//')
+    awk -v acl="$current_acl" -v type="${mode%s}" '
+    BEGIN {
+        n = split(acl, lines, "\n")
+        for (i=1; i<=n; i++) {
+            if (lines[i] ~ "^"type":[^:]+:") {
+                split(lines[i], p, ":")
+                perm[p[2]] = p[3]
+            }
+            if (lines[i] ~ "^default:"type":[^:]+:") {
+                split(lines[i], p, ":")
+                dperm[p[3]] = p[4]
+            }
+        }
+    }
+    {
+        name = $0
+        status = ""
+        if (name in perm) status = status " [現行:" perm[name] "]"
+        if (name in dperm) status = status " [繼承:" dperm[name] "]"
+        if (status != "")
+            printf "%-32s \033[1;32m%s\033[0m\n", name, status
+        else
+            print name
+    }' "$cache_file"
+}
+
+# --- 產生目錄瀏覽清單 ---
+list_dir_entries() {
+    local base="$1"
+    [[ -f "$base" ]] && base=$(dirname "$base")
+    local parent
+    parent=$(realpath "$base/..")
+
+    echo -e "${base}\t📍 ✅ [鎖定此目錄本身作為管理目標] ($base)"
+    echo -e "${parent}\t⬆️  .. (返回上層目錄: $parent)"
+
+    find "$base" -maxdepth 1 -mindepth 1 2>/dev/null | sort | while IFS= read -r item; do
+        local name="${item##*/}"
+        local perm_str
+        perm_str=$(ls -ld "$item" 2>/dev/null | awk '{print $1}')
+        local acl_badge="   "
+        [[ "$perm_str" == *"+"* ]] && acl_badge="\033[1;32m[+ACL]\033[0m"
+
+        if [[ -d "$item" ]]; then
+            printf "%s\t📁 \033[1;34m%-32s\033[0m %b (%s)\n" "$item" "${name}/" "$acl_badge" "$perm_str"
+        else
+            printf "%s\t📄 %-32s %b (%s)\n" "$item" "$name" "$acl_badge" "$perm_str"
+        fi
+    done
+}
+
+# --- 互動式目錄巡檢與切換器 ---
+browse_directory() {
+    local curr="$TARGET"
+    [[ -f "$curr" ]] && curr=$(dirname "$curr")
+
+    while true; do
+        local choice
+        choice=$(list_dir_entries "$curr" | fzf --ansi --height=100% --layout=reverse --border=rounded \
+            --delimiter='\t' --with-nth=2 \
+            --prompt="📂 瀏覽目錄 ($curr) > " \
+            --header="💡 游標移動時右側即時顯示該項目的 ACL 狀態！
+⌨️  [Enter] 進入該子目錄 / 選取檔案  |  選第 1 項 [📍 鎖定此目錄] 進入 ACL 修改面板  |  [Esc] 取消" \
+            --preview="$PREVIEW_HELPER {1}" \
+            --preview-window="right:55%:wrap")
+
+        [[ -z "$choice" ]] && break
+        local picked_path
+        picked_path=$(echo "$choice" | cut -f1)
+        local picked_label
+        picked_label=$(echo "$choice" | cut -f2)
+
+        if [[ "$picked_label" == *"📍"* || -f "$picked_path" ]]; then
+            TARGET="$picked_path"
+            break
+        elif [[ -d "$picked_path" ]]; then
+            curr="$picked_path"
+        fi
+    done
+}
+
+# --- 危險操作：將目前資料夾權限強制套用至下層所有項目 (含雙重確認與備份) ---
+propagate_current_acl() {
+    if [[ ! -d "$TARGET" ]]; then
+        return
+    fi
+
+    # 預先統計受影響的子目錄與檔案數量
+    local dir_count file_count
+    dir_count=$(find "$TARGET" -mindepth 1 -type d -printf '.' 2>/dev/null | wc -c)
+    file_count=$(find "$TARGET" -mindepth 1 -type f -printf '.' 2>/dev/null | wc -c)
+
+    # 第一重確認：選擇同步範圍與策略
+    local mode_choice
+    mode_choice=$(printf "%s\n" \
+        "CANCEL   │ ❌ 取消操作 (返回主選單)" \
+        "DIRS     │ 📁 僅套用至下層所有【子資料夾】(共 $dir_count 個目錄，不動現有檔案)" \
+        "ALL_SAFE │ 🌳 套用至下層【所有子資料夾與檔案】(共 $dir_count 個目錄 + $file_count 個檔案，檔案自動移除 x 執行權限) [推薦]" \
+        "ALL_RAW  │ ⚡ 強制原樣覆寫下層【所有子資料夾與檔案】(檔案也會保留與目錄相同的 x 權限)" | \
+        fzf --ansi --height=100% --layout=reverse --border=rounded \
+            --prompt="⚠️ 確認階段 1/2：選擇向下覆寫範圍 > " \
+            --header="🚨 危險操作警告：這將會清除下層原有的個別 ACL，並強制洗成與 [$TARGET] 完全一致！
+📊 預計影響範圍：$dir_count 個子資料夾、$file_count 個檔案" \
+            --preview="$PREVIEW_HELPER" \
+            --preview-window="right:55%:wrap")
+
+    [[ -z "$mode_choice" || "$mode_choice" == CANCEL* ]] && return
+    local mode
+    mode=$(echo "$mode_choice" | awk '{print $1}')
+
+    # 第二重確認：要求明確點選或輸入 YES 才會放行
+    local final_confirm
+    final_confirm=$(printf "%s\n" \
+        "NO  │ 🛑 不，我改變主意了 (立即中止)" \
+        "YES │ 🔥 我已了解風險，確定立即覆寫下層權限 (執行前會自動備份現有 ACL)" | \
+        fzf --ansi --height=55% --layout=reverse --border=rounded \
+            --prompt="🚨 最終確認階段 2/2 (請輸入或選擇 YES) > " \
+            --header="⚠️ 即將對 [$TARGET] 下方執行不可逆的權限同步 ($mode)！
+請在下方選擇【YES】確認執行，或按 [Esc] / 選擇【NO】取消：" \
+            --preview="$PREVIEW_HELPER" \
+            --preview-window="right:55%:wrap")
+
+    [[ "$final_confirm" != YES* ]] && return
+
+    # 終端機互動式二次輸入驗證 (防止連按兩下 Enter 誤觸)
+    clear
+    echo -e "\033[1;31m======================================================================\033[0m"
+    echo -e "\033[1;31m 🚨 危險操作最終安全鎖 (Safety Lock)\033[0m"
+    echo -e "\033[1;31m======================================================================\033[0m"
+    echo -e " 來源與目標路徑 : \033[1;36m$TARGET\033[0m"
+    echo -e " 選擇的覆寫模式 : \033[1;33m$mode\033[0m"
+    echo -e " 影響子目錄數量 : \033[1;32m$dir_count\033[0m 個資料夾"
+    [[ "$mode" != "DIRS" ]] && echo -e " 影響檔案數量   : \033[1;32m$file_count\033[0m 個檔案"
+    echo -e "----------------------------------------------------------------------"
+    read -r -p "👉 請輸入大寫英文 [YES] 以正式啟動權限覆寫 (輸入其他任意鍵取消): " confirm_text
+
+    if [[ "$confirm_text" != "YES" ]]; then
+        echo -e "\nℹ️  操作已取消，未變更任何權限。"
+        sleep 1.2
+        return
+    fi
+
+    # 1. 自動備份目前目錄樹的完整 ACL (萬一後悔可用 setfacl --restore 救回)
+    local backup_file="$BACKUP_DIR/acl-backup-$(date +%Y%m%d-%H%M%S).facl"
+    echo -e "\n📦 [1/3] 正在備份現有下層 ACL 至 \033[1;33m$backup_file\033[0m ..."
+    if ! ( umask 077; getfacl -R -p "$TARGET" > "$backup_file" ); then
+        echo -e "\n❌ 備份失敗，為安全起見已中止，未變更任何權限。"
+        read -r -p "請按 [Enter] 鍵返回 ACL 控制台..." _
+        return
+    fi
+
+    # 2. 匯出母目錄的 ACL 規則範本
+    local dir_acl_file="$CACHE_DIR/current_dir.acl"
+    local file_acl_file="$CACHE_DIR/current_file.acl"
+    # 剝除 "#effective:" 尾註，確保後續 sed 的 $ 錨點能正確命中每一行
+    getfacl -cp "$TARGET" | sed -E 's/[[:space:]]+#.*$//' > "$dir_acl_file"
+    if [[ ! -s "$dir_acl_file" ]]; then
+        echo -e "\n❌ 無法讀取 $TARGET 的 ACL 作為範本，已中止，未變更任何權限。"
+        read -r -p "請按 [Enter] 鍵返回 ACL 控制台..." _
+        return
+    fi
+
+    # 產生給「一般檔案」專用的 ACL 範本 (剔除 default: 行，且若為 ALL_SAFE 則將 x 降為 -)
+    if [[ "$mode" == "ALL_SAFE" ]]; then
+        grep -v '^default:' "$dir_acl_file" | sed -E 's/:([r-][w-])x$/:\1-/g' > "$file_acl_file"
+    elif [[ "$mode" == "ALL_RAW" ]]; then
+        grep -v '^default:' "$dir_acl_file" > "$file_acl_file"
+    fi
+
+    # 3. 執行批次套用 (setfacl 遇到個別失敗會繼續處理其餘路徑，並對每筆失敗輸出一行 stderr)
+    local err_log="$CACHE_DIR/propagate-errors.log"
+    local dir_fail=0 file_fail=0
+    echo -e "🚀 [2/3] 正在同步所有子資料夾權限 (共 $dir_count 個)..."
+    if [[ "$dir_count" -gt 0 ]]; then
+        find "$TARGET" -mindepth 1 -type d -exec setfacl --set-file="$dir_acl_file" {} + 2>"$err_log"
+        dir_fail=$(wc -l < "$err_log")
+        [[ "$dir_fail" -gt 0 ]] && echo -e "   \033[1;31m⚠️  子資料夾階段 setfacl 回報 $dir_fail 筆錯誤\033[0m"
+    else
+        : > "$err_log"
+    fi
+
+    if [[ "$mode" == "ALL_SAFE" || "$mode" == "ALL_RAW" ]]; then
+        echo -e "🚀 [3/3] 正在同步所有檔案權限 (共 $file_count 個)..."
+        if [[ "$file_count" -gt 0 ]]; then
+            find "$TARGET" -mindepth 1 -type f -exec setfacl --set-file="$file_acl_file" {} + 2>>"$err_log"
+            file_fail=$(( $(wc -l < "$err_log") - dir_fail ))
+            [[ "$file_fail" -gt 0 ]] && echo -e "   \033[1;31m⚠️  檔案階段 setfacl 回報 $file_fail 筆錯誤\033[0m"
+        fi
+    else
+        echo -e "⏭️  [3/3] 已略過一般檔案 (僅套用子資料夾)。"
+    fi
+
+    local total_fail=$(( dir_fail + file_fail ))
+    if [[ "$total_fail" -eq 0 ]]; then
+        echo -e "\n✅ \033[1;32m下層權限已全數同步完成！\033[0m"
+    else
+        echo -e "\n⚠️  \033[1;31m同步結束，但 setfacl 回報 $total_fail 筆錯誤 (子資料夾階段 $dir_fail / 檔案階段 $file_fail)，部分項目可能未套用。\033[0m"
+        echo -e "   失敗明細 (最多顯示 10 筆，完整記錄在 $err_log)："
+        head -n 10 "$err_log" | sed 's/^/   /'
+    fi
+    echo -e "💡 若需還原此次操作，可隨時執行: \033[1;36msetfacl --restore=$backup_file\033[0m"
+    read -r -p "請按 [Enter] 鍵返回 ACL 控制台..." _
+}
+
+# --- 移除條目 (現行 + 預設) 並回報錯誤 ---
+# setfacl -x 對不存在的條目是靜默 no-op (對檔案下 d: 亦同)，因此任何 stderr 都代表真正的失敗
+remove_entry() {
+    local rflag="$1" spec="$2"
+    local err
+    if ! err=$(setfacl $rflag -x "$spec" -x "d:$spec" "$TARGET" 2>&1); then
+        echo -e "\n❌ \033[1;31m移除條目 [$spec]${rflag:+ (遞迴)} 失敗：\033[0m"
+        echo "$err" | sed 's/^/   /'
+        read -r -p "請按 [Enter] 鍵返回 ACL 控制台..." _
+        return 1
+    fi
+}
+
+# --- 互動式選擇權限與範圍並執行 ---
+apply_acl_wizard() {
+    local type_flag="$1"
+    local entities="$2"
+
+    local perm_choice
+    perm_choice=$(printf "%s\n" \
+        "rwx  │ 🟢 完整控制 (讀取 + 寫入 + 執行/進入目錄)" \
+        "r-X  │ 🔵 智慧唯讀 (讀取 + 僅對目錄賦予進入權限 X) [推薦！]" \
+        "rwX  │ 🟡 讀寫模式 (讀寫 + 僅對目錄賦予進入權限 X)" \
+        "r-x  │ ⚪ 固定唯讀 (讀取 + 強制執行)" \
+        "---  │ 🔴 拒絕存取 (掛載空權限以阻擋特定對象)" | \
+        fzf --ansi --height=100% --layout=reverse --border=rounded \
+            --prompt="步驟 2/3：選擇權限 > " \
+            --header="🔑 將套用至: $(echo "$entities" | tr '\n' ' ')" \
+            --preview="$PREVIEW_HELPER" \
+            --preview-window="right:55%:wrap")
+    [[ -z "$perm_choice" ]] && return
+    local perm
+    perm=$(echo "$perm_choice" | awk '{print $1}')
+
+    local scope="3"
+    if [[ -d "$TARGET" ]]; then
+        local scope_choice
+        scope_choice=$(printf "%s\n" \
+            "1 │ 📁 此目錄 + Default 繼承          (新建立的檔案/子目錄自動套用)" \
+            "2 │ 🌳 遞迴所有子項目 (-R) + 繼承     (整個資料夾樹統一權限，最常用！)" \
+            "3 │ 📌 僅修改此目錄本身               (不設定 Default 繼承，也不遞迴)" \
+            "4 │ 🔄 僅遞迴現有檔案 (-R)            (不設定未來的 Default 繼承)" | \
+            fzf --ansi --height=100% --layout=reverse --border=rounded \
+                --prompt="步驟 3/3：選擇套用範圍 > " \
+                --header="📂 目標為目錄，請選擇遞迴與預設繼承策略：" \
+                --preview="$PREVIEW_HELPER" \
+                --preview-window="right:55%:wrap")
+        [[ -z "$scope_choice" ]] && return
+        scope=$(echo "$scope_choice" | awk '{print $1}')
+    fi
+
+    while IFS= read -r entity; do
+        [[ -z "$entity" ]] && continue
+        case "$scope" in
+            1)
+                setfacl -m "${type_flag}:${entity}:${perm}" -m "d:${type_flag}:${entity}:${perm}" "$TARGET"
+                ;;
+            2)
+                setfacl -R -m "${type_flag}:${entity}:${perm}" "$TARGET"
+                find "$TARGET" -type d -exec setfacl -m "d:${type_flag}:${entity}:${perm}" {} +
+                ;;
+            3)
+                setfacl -m "${type_flag}:${entity}:${perm}" "$TARGET"
+                ;;
+            4)
+                setfacl -R -m "${type_flag}:${entity}:${perm}" "$TARGET"
+                ;;
+        esac
+    done <<< "$entities"
+}
+
+# --- 主畫面迴圈 ---
+SELF_Q=$(printf '%q' "$SELF")
+while true; do
+    export TUI_ACL_TARGET="$TARGET"
+    SELECTION=$(build_main_menu "$TARGET" | fzf --ansi --height=100% --layout=reverse --border=rounded \
+        --delimiter='\t' --with-nth=2 \
+        --prompt="ACL 控制台 > " \
+        --header="🎯 目標: $TARGET
+⌨️  [Enter] 執行/修改  |  [Ctrl-D] 刪除所選條目  |  [Ctrl-R] 重整 AD 快取  |  [Esc] 離開" \
+        --bind="ctrl-d:execute($SELF_Q --delete-entry {1})+reload($SELF_Q --dump-menu)" \
+        --expect="ctrl-r" \
+        --preview="$PREVIEW_HELPER" \
+        --preview-window="right:52%:wrap")
+
+    KEY=$(echo "$SELECTION" | head -n1)
+    LINE=$(echo "$SELECTION" | tail -n +2)
+
+    if [[ "$KEY" == "ctrl-r" ]]; then
+        get_entities users force >/dev/null
+        get_entities groups force >/dev/null
+        continue
+    fi
+
+    [[ -z "$LINE" ]] && break
+    TAG=$(echo "$LINE" | cut -f1)
+
+    case "$TAG" in
+        ACT:EXIT)
+            break
+            ;;
+        SEP)
+            continue
+            ;;
+        ACT:CHDIR)
+            browse_directory
+            ;;
+        ACT:ADD_USER)
+            SEL_USERS=$(get_entities users | fzf --ansi -m --height=100% --layout=reverse --border=rounded \
+                --prompt="步驟 1/3：搜尋使用者 > " \
+                --header="👤 按 [Tab] 可勾選多位使用者，[Enter] 下一步 (顯示 [現行/繼承] 代表已設定過)" \
+                --preview="$PREVIEW_HELPER" \
+                --preview-window="right:52%:wrap" | sed 's/ *\[.*$//')
+            [[ -n "$SEL_USERS" ]] && apply_acl_wizard "u" "$SEL_USERS"
+            ;;
+        ACT:ADD_GROUP)
+            # 注意：不可使用 GROUPS 作為變數名，它是 bash 保留的特殊陣列，賦值會被忽略
+            SEL_GROUPS=$(get_entities groups | fzf --ansi -m --height=100% --layout=reverse --border=rounded \
+                --prompt="步驟 1/3：搜尋群組 > " \
+                --header="👥 按 [Tab] 可勾選多個網域/本機群組，[Enter] 下一步" \
+                --preview="$PREVIEW_HELPER" \
+                --preview-window="right:52%:wrap" | sed 's/ *\[.*$//')
+            [[ -n "$SEL_GROUPS" ]] && apply_acl_wizard "g" "$SEL_GROUPS"
+            ;;
+        ACT:PROPAGATE)
+            propagate_current_acl
+            ;;
+        ACT:EDIT_RAW)
+            TMPF=$(mktemp "$CACHE_DIR/edit.XXXXXX")
+            if ! getfacl -p "$TARGET" > "$TMPF"; then
+                echo -e "\n❌ 無法讀取 $TARGET 的 ACL，未開啟編輯器。"
+                rm -f "$TMPF"
+                read -r -p "請按 [Enter] 鍵返回 ACL 控制台..." _
+            else
+                ORIG_SUM=$(md5sum < "$TMPF")
+                ${EDITOR:-vim} "$TMPF"
+                if [[ "$(md5sum < "$TMPF")" == "$ORIG_SUM" ]]; then
+                    # 內容未變更 (或未存檔)，不做任何套用
+                    rm -f "$TMPF"
+                elif ERR_MSG=$(setfacl --set-file="$TMPF" "$TARGET" 2>&1); then
+                    rm -f "$TMPF"
+                else
+                    echo -e "\n❌ \033[1;31mACL 套用失敗，權限未變更：\033[0m"
+                    echo "$ERR_MSG" | sed 's/^/   /'
+                    echo -e "📝 你的編輯內容已保留在 \033[1;33m$TMPF\033[0m，可修正後再執行: \033[1;36msetfacl --set-file=$TMPF '$TARGET'\033[0m"
+                    read -r -p "請按 [Enter] 鍵返回 ACL 控制台..." _
+                fi
+            fi
+            ;;
+        ACT:RECALC_MASK)
+            # --mask 會忽略給定的 mask 值，改以所有 group/named 條目的聯集重新計算
+            # 僅在已有 mask / default ACL 時才重算，否則 setfacl 會憑空新增 mask 或整組 default 條目
+            CUR_ACL=$(getfacl -cp "$TARGET" 2>/dev/null)
+            if grep -q '^mask::' <<< "$CUR_ACL"; then
+                setfacl --mask -m m::--- "$TARGET"
+            fi
+            if [[ -d "$TARGET" ]] && grep -q '^default:' <<< "$CUR_ACL"; then
+                setfacl --mask -m d:m::--- "$TARGET"
+            fi
+            ;;
+        ACT:CLEAR_ALL)
+            CONFIRM=$(printf "No  │ 取消操作\nYes │ 確定清除此路徑的擴充 ACL (-b)\nRec │ 遞迴清除整個目錄樹的所有擴充 ACL (-R -b)" | \
+                fzf --height=50% --layout=reverse --border=rounded --header="⚠️ 請確認是否清除擴充 ACL：")
+            if [[ "$CONFIRM" == Yes* ]]; then
+                setfacl -b "$TARGET"
+            elif [[ "$CONFIRM" == Rec* ]]; then
+                setfacl -R -b "$TARGET"
+            fi
+            ;;
+        ITEM:*)
+            RAW_SPEC="${TAG#ITEM:?:}"
+            ETYPE="${RAW_SPEC%%:*}"
+            ENAME="${RAW_SPEC#*:}"
+            TFLAG="${ETYPE:0:1}"
+
+            ITEM_ACT=$(printf "%s\n" \
+                "MOD │ 🔑 重新設定 [$ENAME] 的權限與繼承範圍" \
+                "DEL │ 🗑️  僅從此路徑移除 [$ENAME] 條目" \
+                "RDL │ 🌳 從整個目錄樹遞迴移除 (-R -x) [$ENAME] 條目" | \
+                fzf --height=60% --layout=reverse --border=rounded \
+                    --header="針對已存在的條目 ($ETYPE: $ENAME) 進行操作：" \
+                    --preview="$PREVIEW_HELPER" --preview-window="right:52%:wrap")
+            case "$ITEM_ACT" in
+                MOD*) apply_acl_wizard "$TFLAG" "$ENAME" ;;
+                DEL*) remove_entry ""   "${TFLAG}:${ENAME}" ;;
+                RDL*) remove_entry "-R" "${TFLAG}:${ENAME}" ;;
+            esac
+            ;;
+    esac
+done
